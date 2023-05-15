@@ -1,0 +1,33 @@
+;;
+;---------------------------------------
+; Z80 SBC ROM entry points
+; -- must match the definitions in zsbc-rom.z80
+;
+rom$base	equ	0F000H		;Base of the Z80 SBC ROM
+
+cold$start	equ     rom$base+0	;hardware initialization on RESET
+warm$start	equ     rom$base+3	;ROM monitor entry point
+
+getc		equ     rom$base+6	;get a char from the serial interface
+putc		equ     rom$base+9	;put a char to the serial interface
+rx$avail	equ     rom$base+12	;check if char available from the serial interface
+tx$ready	equ     rom$base+15	;check if the serial interface will accept a char
+
+ide$reset	equ     rom$base+18	;reset the IDE controller
+set$addr	equ     rom$base+21	;set the IDE sector and track
+ide$read	equ     rom$base+24	;read sector from the IDE drive
+ide$write	equ     rom$base+27	;write sector to the IDE drive
+ide$b$read	equ     rom$base+30	;read sector from the IDE drive with RAM bank selection
+ide$b$write	equ     rom$base+33	;write sector to the IDE drive with RAM bank selection
+get$status	equ     rom$base+36	;get the IDE status register
+get$error	equ     rom$base+39	;get the IDE error register
+put$status	equ     rom$base+42	;output IDE controller status to the serial interface
+
+set$bank	equ     rom$base+45	;set RAM/ROM banks
+get$iobyte	equ     rom$base+48	;read IOBYTE
+
+puts		equ     rom$base+51	;output a nul-terminated string
+put$byte	equ     rom$base+54	;output a byte in hexadecimal notation
+put$word	equ     rom$base+57	;output a word in hexadecimal notation
+put$crlf	equ     rom$base+60	;output CR/LF
+put$regs	equ     rom$base+63	;output registers (for debug)

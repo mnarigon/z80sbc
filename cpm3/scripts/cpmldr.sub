@@ -1,0 +1,15 @@
+;build CPMLDR.COM - CP/M submit file
+r cpmldr.rel
+r ldrbios3.asm
+r zsbcrom.lib
+
+r cpm3.lib
+r makedate.lib
+r z80.lib
+
+rmac ldrbios3.asm
+
+link cpmldr[L100]=cpmldr,ldrbios3
+
+w cpmldr.com b
+a:

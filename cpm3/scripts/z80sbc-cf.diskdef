@@ -1,0 +1,12 @@
+# -- Z80 SBC CP/M 3.0 Drive A: for a Compact Flash card
+diskdef z80sbc-cf
+  seclen 512
+  # -- 512 tracks offset by 1 system track
+  tracks 513
+  sectrk 64
+  blocksize 8192
+  maxdir 4096
+  skew 0
+  boottrk 1
+  os 3
+end

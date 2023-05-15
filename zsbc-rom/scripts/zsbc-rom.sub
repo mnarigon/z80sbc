@@ -1,0 +1,8 @@
+;build zsbc-rom.hex - CP/M submit file
+r zsbc-rom.z80
+
+z80asm zsbc-rom FH
+
+w zsbc-rom.hex
+w zsbc-rom.lst
+a:

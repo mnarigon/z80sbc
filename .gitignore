@@ -1,0 +1,15 @@
+# -- git ignore file
+# -- finder database files
+.DS_Store
+# -- generated files
+cpm3/cf_banked.img
+cpm3/cf_unbanked.img
+cpm3/cpm_gen/CPM3_BANKED.SYS
+cpm3/cpm_gen/CPM3_UNBANKED.SYS
+cpm3/cpm_gen/CPMLDR.COM
+simh/i.dsk
+zsbc-rom/zsbc-rom.hex
+zsbc-rom/zsbc-rom.lst
+zsbc-rom.hex
+cf_banked.img
+cf_unbanked.img

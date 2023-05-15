@@ -1,0 +1,34 @@
+;build banked CPM.SYS - CP/M submit file
+r boot3.asm
+r chario3.asm
+r diskio3.asm
+r drvtbl3.asm
+r kernel3.asm
+r move3.asm
+r scb3.asm
+r zsbcrom.lib
+
+r gencpm.dat
+
+r bdos3.spr
+r bnkbdos3.spr
+r resbdos3.spr
+r cpm3.lib
+r makedate.lib
+r modebaud.lib
+r z80.lib
+
+rmac boot3.asm
+rmac chario3.asm
+rmac diskio3.asm
+rmac drvtbl3.asm
+rmac kernel3.asm
+rmac move3.asm
+rmac scb3.asm
+
+link bnkbios3[b]=kernel3,boot3,move3,chario3,diskio3,drvtbl3,scb3
+
+gencpm auto display
+
+w cpm3.sys B
+a:

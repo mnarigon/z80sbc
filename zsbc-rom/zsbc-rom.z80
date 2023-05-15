@@ -1,0 +1,2946 @@
+	title 'Z80 SBC ROM Monitor'
+;;
+;---------------------------------------
+;
+rom_base	equ	0F000H
+ram_top		equ	rom_base
+
+;;
+;---------------------------------------
+; CPMLDR.COM load from system track
+; keep consistent with bios3/boot3.asm
+ldr_size	equ	4992			;CPMLDR.COM file size in bytes
+ldr_count	equ	(ldr_size+511)/512	;sector count
+ldr_track	equ	0			;starting track
+ldr_sector	equ	0			;starting sector
+ldr_addr	equ	0100H			;load address
+
+;;
+;---------------------------------------
+; Z80 SBC ports
+;
+
+;;
+;---------------------------------------
+; base port (set with SW101)
+;
+base_port	equ	30H
+
+;;
+;---------------------------------------
+; serial ports
+ser_data_port	equ	base_port+4	;data port for DLP-USB interface
+ser_status_port	equ	base_port+6	;status port for DLP-USB interface
+ser_RXE		equ	80H		;RXE#, if 0 receive data available
+ser_TXE		equ	40H		;TXE#, if 0 transmit ready
+
+;;
+;---------------------------------------
+; IOBYTE and RAM/ROM bank ports
+iobyte_port	equ	base_port+6	;IOBYTE port - read bits 5-0
+bank_port	equ	base_port+6	;ROM Bank - write bit 1
+					;RAM Bank - write bit 0
+
+;;
+;---------------------------------------
+; IDE ports
+;
+ide_port_A	equ	base_port+0
+ide_port_B	equ	base_port+1
+ide_port_C	equ	base_port+2
+ide_port_ctrl	equ	base_port+3
+
+; IDE line definitions
+ide_rd_config	equ	10010010B	;port C output, ports A/B input
+ide_wr_config	equ	10000000B	;ports A/B/C output
+
+ide_rst_line	equ	80H		;bit for IDE controller reset line
+ide_rd_line	equ	40H		;bit for IDE controller read line
+ide_wr_line	equ	20H		;bit for IDE controller write line
+
+; IDE drive controller registers
+ide_reg_data	equ	08H
+ide_reg_error	equ	09H
+ide_reg_seccnt	equ	0AH
+
+ide_reg_lba0	equ	0BH
+ide_reg_lba1	equ	0CH
+ide_reg_lba2	equ	0DH
+ide_reg_lba3	equ	0EH
+
+ide_reg_cmd	equ	0FH
+ide_reg_status	equ	0FH
+
+; IDE commands
+ide_cmd_read	equ	20H
+ide_cmd_write	equ	30H
+ide_cmd_id	equ	0ECH
+
+;;
+;---------------------------------------
+; NOTE - the IDE routines use:
+;   512 byte physical sectors
+;   64 sectors per track numbered (0-63)
+ide_max_sec	equ	64
+ide_retries	equ	100		;number of retries for polls
+
+;;
+;---------------------------------------
+; ide_reg_status register:
+;   MSB
+;   7: 1 = Busy - indicates the drive is executing a command
+;   6: 1 = Drive ready - indicates the drive is capable of responding to a command
+;   5: 1 = Drive write fault - indicates current write fault status
+;   4: 1 = Drive seek complete - indicates a drive is settled over a track
+;   3: 1 = Data Request - indicates the drive is ready to transfer
+;   2: 1 = Corrected data - indicates a correctable data error was encountered
+;   1: 1 = Index - set once per disk revolution
+;   0: 1 = Error - error occurred during execution of previous command
+;   LSB
+ide_BSY		equ	80H
+ide_DRDY	equ	40H
+ide_DWF		equ	20H
+ide_DSC		equ	10H
+ide_DRQ		equ	08H
+ide_CORR	equ	04H
+ide_IDX		equ	02H
+ide_ERR		equ	01H
+
+;;
+;---------------------------------------
+; ide_reg_error register:
+;   MSB
+;   7: 1 = Bad block detected
+;   6: 1 = Uncorrectable data error
+;   5: 1 = Media changed
+;   4: 1 = ID not found
+;   3: 1 = Media change requested
+;   2: 1 = Aborted command
+;   1: 1 = Track 0 not found
+;   0: 1 = Address mark not found
+;   LSB
+ide_BBK		equ	80H
+ide_UNC		equ	40H
+ide_MC		equ	20H
+ide_IDNF	equ	10H
+ide_MCR		equ	08H
+ide_ABRT	equ	04H
+ide_TK0NF	equ	02H
+ide_AMNF	equ	01H
+
+;;
+;---------------------------------------
+; ide_reg_lba3 register:
+;   MSB
+;   7	 : Always 1
+;   6	 : CHS (0) or LBA (1) access mode
+;   5	 : Always 1
+;   4	 : Master (0) or slave (1) selection
+;   3 - 0: Head (CHS mode) or LBA bits 27 - 24 (LBA mode)
+;   LSB
+;
+ide_lba_master	equ	0E0H		;select LBA mode and master
+ide_lba_mask	equ	00FH		;select LBA bit mask
+
+;;
+;---------------------------------------
+; Z80 SBC ROM Monitor RAM usage
+;
+line_size	equ	80
+
+ram_size	equ	line_size+1+1
+ram_base	equ	ram_top-ram_size
+stack_top	equ	ram_base
+
+	org	ram_base
+line_buffer:	ds	line_size+1	;line input buffer (plus ending NUL)
+last_char:	ds	1		;last input char (for CR/LF detection)
+
+;;
+;---------------------------------------
+; character definitions
+;
+NUL_CH		equ	00H
+CONTROL_C	equ	03H
+BACKSPACE	equ	08H
+TAB		equ	09H
+LF		equ	0AH
+CR		equ	0DH
+CONTROL_Q	equ	11H
+CONTROL_S	equ	13H
+CONTROL_U	equ	15H
+ESCAPE		equ	1BH
+SPACE		equ	20H
+DELETE		equ	7FH
+
+;;
+;---------------------------------------
+; Z80 SBC ROM entry points
+;
+	org	rom_base
+	jp	cold_start		;hardware initialization on RESET
+	jp	warm_start		;ROM monitor entry point
+
+	jp	getc			;get a char from the serial interface
+	jp	putc			;put a char to the serial interface
+	jp	rx_avail		;check if a char is available from the serial interface
+	jp	tx_ready		;check if the serial interface will accept a char
+
+	jp	ide_reset		;reset the IDE controller
+	jp	ide_set_addr		;set the IDE sector and track
+	jp	ide_read		;read a sector from the IDE drive
+	jp	ide_write		;write a sector to the IDE drive
+	jp	ide_bank_read		;read a sector from the IDE drive with RAM bank selection
+	jp	ide_bank_write		;write a sector to the IDE drive with RAM bank selection
+	jp	ide_get_status		;get the IDE status register
+	jp	ide_get_error		;get the IDE error register
+	jp	ide_put_status		;output IDE controller status to the serial interface
+
+	jp	set_bank		;set RAM/ROM banks
+	jp	get_iobyte		;read IOBYTE
+
+	jp	puts			;output a nul-terminated string
+	jp	put_byte		;output a byte in hexadecimal notation
+	jp	put_word		;output a word in hexadecimal notation
+	jp	put_crlf		;output CR/LF
+	jp	put_regs		;output registers (for debug)
+
+;;
+;---------------------------------------
+; cold_start - hardware initialization on RESET
+;
+cold_start:
+	di				;no interrupts
+	xor	a
+	ld	i,a			;Z80 interrupt page 0
+	out	(bank_port),a		;ROM bank 0, RAM bank 0
+	ld	(last_char),a		;init last input char
+	ld	sp,stack_top		;set stack pointer to top of non-reserved RAM
+
+cold_start0:
+	call	rx_avail		;clear serial input buffer
+	jr	z,cold_start1		;empty
+
+	call	getc
+	jr	cold_start0
+
+cold_start1:
+	ld	hl,cold_msg		;print cold boot message
+	call	puts
+
+	jr	warm_start
+
+cold_msg:
+	db	CR,LF
+	db	'Z80 SBC ROM Monitor Version 1.0',CR,LF
+	db	'Type ''H'' for help',CR,LF,0
+
+;;
+;---------------------------------------
+; warm_start - ROM monitor entry point
+;
+warm_start:
+	ld	sp,stack_top		;reset stack pointer to top of RAM
+	ld	hl,prompt_msg
+	call	puts			;output prompt
+
+	ld	b,line_size
+	ld	de,line_buffer
+	call	get_line		;get input line
+
+	call	match_EOL
+	jr	nc,warm_start		;empty line
+
+	ld	hl,root_cmd_table
+	call	do_cmd			;do the command
+	jr	warm_start		;and loop
+
+prompt_msg:
+	db	'-> ',0
+
+;;
+;---------------------------------------
+; getc - get a char from the serial interface
+; return
+;   A - the input character
+; uses
+;
+getc:
+	in	a,(ser_status_port)
+	and	ser_RXE
+	jr	nz,getc
+	in	a,(ser_data_port)
+	ret
+
+;;
+;---------------------------------------
+; putc - put a char to the serial interface
+; input
+;   C - the character
+; uses
+;
+putc:
+	in	a,(ser_status_port)
+	and	ser_TXE
+	jr	nz,putc
+	ld	a,c
+	out	(ser_data_port),a
+	ret
+
+;;
+;---------------------------------------
+; rx_avail - check if a char is available from the serial interface
+; return
+;   A - 0 if receive buffer empty
+;   A - 0FFH if input available
+; uses
+;
+rx_avail:
+	in	a,(ser_status_port)
+	cpl
+	and	ser_RXE
+	ret	z
+	xor	a
+	dec	a
+	ret
+
+;;
+;---------------------------------------
+; tx_ready - check if the serial interface will accept a char
+; return
+;   A - 0 if transmit buffer full
+;   A - 0FFH if the buffer is ready
+; uses
+;
+tx_ready:
+	in	a,(ser_status_port)
+	cpl
+	and	ser_TXE
+	ret	z
+	xor	a
+	dec	a
+	ret
+
+;;
+;---------------------------------------
+; ide_reset - reset the IDE controller
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the controller reported a timeout
+;   A - 0FFH if the controller reported an error
+; uses B, DE, 2 stack words
+;
+ide_reset:
+	call	ll_rst			;reset the drive controller
+	ret	nz			;error or timeout
+	call	ll_chk			;any errors?
+	ret				;return final status
+
+;;
+;---------------------------------------
+; ide_set_addr - set LBA registers of the IDE drive
+; input
+;   C - sector (0-63)
+;   DE - track
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+; uses B, HL, 2 stack words
+;
+ide_set_addr:
+	call	ide_calc_lba		;convert sector and track to LBA
+	ex	de,hl			;save LBA2, LBA1 in HL
+
+	call	ll_rdy			;is the drive ready?
+	ret	nz			;no - timeout
+
+	ld	d,1
+	ld	e,ide_reg_seccnt
+	call	ll_wc			;set one sector transfer
+
+	ld	d,c
+	ld	e,ide_reg_lba0
+	call	ll_wc			;set LBA0
+
+	ld	d,l
+	ld	e,ide_reg_lba1
+	call	ll_wc			;set LBA1
+
+	ld	d,h
+	ld	e,ide_reg_lba2
+	call	ll_wc			;set LBA2
+
+	ld	d,ide_lba_master	;select LBA mode and master drive
+	ld	e,ide_reg_lba3
+	call	ll_wc
+	xor	a			;OK
+	ret
+
+;;
+;---------------------------------------
+; ide_read - read a sector from the IDE drive
+; input
+;   HL - memory address
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+;   HL - points to the address after the last read
+; uses BC, DE, 2 stack words
+;
+ide_read:
+	jp	ll_read
+
+;;
+;---------------------------------------
+; ide_write - write a sector to the IDE drive
+; input
+;   HL - memory address
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+;   HL - points to the address after the last read
+; uses BC, DE, 2 stack words
+;
+ide_write:
+	jp	ll_write
+
+;;
+;---------------------------------------
+; ide_bank_read - read a sector from the IDE drive with RAM bank selection
+; input
+;   B - DMA bank
+;   C - current bank
+;   HL - memory address
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+;   HL - points to the address after the last read
+; uses DE, IX, 4 stack words
+;
+ide_bank_read:
+	ld	ix,ll_read
+	jp	ll_bank_op
+
+;;
+;---------------------------------------
+; ide_bank_write - write to the IDE drive with RAM bank selection
+; input
+;   B - DMA bank
+;   C - current bank
+;   HL - memory address
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+;   HL - points to the address after the last read
+; uses DE, IX, 4 stack words
+;
+ide_bank_write:
+	ld	ix,ll_write
+	jp	ll_bank_op
+
+;;
+;---------------------------------------
+; ide_get_status - get the controller status register
+; return
+;   A - controller status register contents
+; uses DE, 1 stack word
+;
+ide_get_status:
+	ld	e,ide_reg_status
+	call	ll_rc			;read status register
+	ld	a,d
+	ret
+
+;;
+;---------------------------------------
+; ide_get_error - get the controller error register
+; return
+;   A - controller error register contents
+; uses DE, 1 stack word
+;
+ide_get_error:
+	ld	e,ide_reg_error
+	call	ll_rc			;read error register
+	ld	a,d
+	ret
+
+;;
+;---------------------------------------
+; ide_put_status - output IDE controller status
+; input
+;   A - last return status
+; uses BC, DE, HL, 3 stack words
+;
+ide_put_status:
+	cp	0FEH
+	jr	nz, ide_ps0		;test for timeout
+
+	ld	hl,ide_ps_msg1		;print timeout message
+	call	puts
+
+ide_ps0:
+	ld	hl,ide_ps_msg1		;print controller status message
+	call	puts
+
+	ld	e,ide_reg_status
+	call	ll_rc			;get controller status
+	ld	c,d
+	call	put_byte		;output byte
+	call	put_crlf
+
+	ld	a,d			;status
+	push	af
+	ld	hl,ide_ps_tbl0		;point at table of messages
+ide_ps1:
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	inc	hl			;message in DE
+	add	a			;shift A left, MSB in carry
+	ld	b,a			;save A
+	ex	de,hl
+	jr	nc,ide_ps2
+	call	puts			;print message if carry
+	call	put_crlf
+ide_ps2:
+	ex	de,hl
+	ld	a,b			;restore A
+	and	a
+	jr	nz,ide_ps1		;loop if A not zero
+
+	pop	af			;restore status
+	and	ide_ERR			;check ERR bit
+	ret	z			;zero, done
+
+	ld	hl,ide_ps_msg2		;print error code message
+	call	puts
+
+	ld	e,ide_reg_error
+	call	ll_rc			;get controller error code
+	ld	c,d
+	call	put_byte		;output byte
+	call	put_crlf
+
+	ld	a,d			;error code
+	ld	hl,ide_ps_tbl1		;point at table of messages
+ide_ps3:
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	inc	hl			;message in DE
+	add	a			;shift A left, MSB in carry
+	ld	b,a			;save A
+	ex	de,hl
+	jr	nc,ide_ps4
+	call	puts			;print message if carry
+	call	put_crlf
+ide_ps4:
+	ex	de,hl
+	ld	a,b			;restore A
+	and	a
+	jr	nz,ide_ps3		;loop if A not zero
+	ret				;and done
+
+ide_ps_tbl0:
+	dw	ide_ps_msg3
+	dw	ide_ps_msg4
+	dw	ide_ps_msg5
+	dw	ide_ps_msg6
+	dw	ide_ps_msg7
+	dw	ide_ps_msg8
+	dw	ide_ps_msg9
+	dw	ide_ps_msg10
+
+ide_ps_tbl1:
+	dw	ide_ps_msg11
+	dw	ide_ps_msg12
+	dw	ide_ps_msg13
+	dw	ide_ps_msg14
+	dw	ide_ps_msg15
+	dw	ide_ps_msg16
+	dw	ide_ps_msg17
+	dw	ide_ps_msg18
+
+ide_ps_msg0:
+	db	'IDE timeout',CR,LF,0
+ide_ps_msg1:
+	db	'IDE controller status: ',0
+ide_ps_msg2:
+	db	'IDE error code: ',0
+
+ide_ps_msg3:
+	db	' Busy',0
+ide_ps_msg4:
+	db	' Drive Ready',0
+ide_ps_msg5:
+	db	' Drive Write Fault',0
+ide_ps_msg6:
+	db	' Drive Seek Complete',0
+ide_ps_msg7:
+	db	' Data Request Ready',0
+ide_ps_msg8:
+	db	' Corrected Data',0
+ide_ps_msg9:
+	db	' Index',0
+ide_ps_msg10:
+	db	' Error',0
+
+ide_ps_msg11:
+	db	' Bad Block',0
+ide_ps_msg12:
+	db	' Uncorrectable Data',0
+ide_ps_msg13:
+	db	' Media Changed',0
+ide_ps_msg14:
+	db	' ID Mark Not Found',0
+ide_ps_msg15:
+	db	' Media Change Requested',0
+ide_ps_msg16:
+	db	' Command Aborted',0
+ide_ps_msg17:
+	db	' Track 0 Not Found',0
+ide_ps_msg18:
+	db	' No Address Mark',0
+
+;;
+;---------------------------------------
+; set_bank - set the RAM/ROM bank
+; input
+;   A - bit 1 - ROM bank, bit 0 - RAM bank
+; uses
+;
+set_bank:
+	and	03H			;mask non-bank bits
+	out	(bank_port),a
+	ret
+
+;;
+;---------------------------------------
+; get_iobyte - get the IOBYTE
+; return
+;   A - IOBYTE
+; uses
+;
+get_iobyte:
+	in	a,(iobyte_port)
+	and	3FH			;mask non-iobyte bits
+	ret
+
+;;
+;---------------------------------------
+; puts - output a nul-terminated string
+; input
+;   HL - the address of the string
+; uses C, 1 stack word
+;
+puts:
+	ld	a,(hl)
+	and	a			;end of string reached?
+	ret	z			;yes
+	ld	c,a
+	call	putc
+	inc	hl			;increment character pointer
+	jr	puts			;next character
+
+;;
+;---------------------------------------
+; put_byte - output a byte in hexadecimal notation
+; input
+;  C - the byte
+; uses 2 stack words
+;
+put_byte:
+	push	bc
+	ld	a,c
+	rrca
+	rrca
+	rrca
+	rrca
+	ld	c,a
+	call	put_digit		;put high nibble
+	pop	bc
+	call	put_digit		;put low nibble
+	ret
+
+;;
+;---------------------------------------
+; put_word - output a word in hexadecimal notation
+; input
+;   HL - the word
+; uses C, 3 stack words
+;
+put_word:
+	ld	c,h
+	call	put_byte
+	ld	c,l
+	call	put_byte
+	ret
+
+;;
+;---------------------------------------
+; put_crlf - output CR/LF
+; uses C, 1 stack word
+put_crlf:
+	ld	c,CR
+	call	putc
+	ld	c,LF
+	call	putc
+	ret
+
+;;
+;---------------------------------------
+; IDE drive routines
+;
+
+;;
+;---------------------------------------
+; ll_bank_op - perform read/write operation with RAM bank selection
+; input
+;   B - DMA bank
+;   C - current bank
+;   HL - memory address
+;   IX - pointer to ll_read or ll_write
+; return
+;   A - 0 if the command was successful
+;   A - 0FFH if the drive reported an error or timeout
+;   HL - points to the address after the last read
+; uses DE, 4 stack words
+;
+ll_bank_op:
+	ld	a,b
+	call	set_bank		;set the DMA bank
+
+	push	bc			;save bank info
+	call	op_trampoline		;operation
+	pop	bc
+
+	push	af			;save status
+	ld	a,c
+	call	set_bank		;back to the current bank
+	pop	af
+	ret
+
+;;
+;---------------------------------------
+; ll_multi_op - perform multiple read/write operations
+; input
+;   B - sector count
+;   C - starting sector (0-63)
+;   DE - starting track
+;   HL - memory address
+;   IX - pointer to ll_read or ll_write
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+;   HL - points to the address after the last operation
+; uses 5 stack words
+;
+ll_multi_op:
+	push	bc
+	push	de
+	push	hl
+	call	ide_set_addr		;set address
+	jr	nz,ll_multi_op1		;report error
+
+	pop	hl
+	call	op_trampoline		;operation
+	jr	nz,ll_multi_op2		;report error
+
+	pop	de
+	pop	bc
+	inc	c			;next sector
+	ld	a,c
+	cp	ide_max_sec		;greater than max sectors
+	jr	c,ll_multi_op0
+	inc	de			;next track
+	ld	c,0
+ll_multi_op0:
+	djnz	ll_multi_op
+	xor	a
+	ret
+
+ll_multi_op1:
+	pop	hl
+ll_multi_op2:
+	pop	de
+	pop	bc			;clean up stack
+	ret
+
+op_trampoline:
+	jp	(ix)
+
+;;
+;---------------------------------------
+; ll_read - read a sector from the IDE drive
+; input
+;   HL - memory address
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+;   HL - points to the address after the last read
+; uses BC, DE, 2 stack words
+;
+ll_read:
+	call	ll_rdy			;is the drive ready?
+	ret	nz			;no - timeout
+
+	ld	d,ide_cmd_read
+	ld	e,ide_reg_cmd
+	call	ll_wc			;issue read command
+
+	call	ll_rdy			;can we proceed?
+	ret	nz			;no - timeout
+
+	call	ll_chk			;any errors?
+	ret	nz			;yes - something went wrong
+
+	call	ll_brdy			;is the buffer ready to read?
+	ret	nz			;no
+
+	call	ll_rb			;read the buffer
+
+	call	ll_rdy			;can we proceed?
+	ret	nz			;no - timeout
+
+	call	ll_chk			;any errors?
+	ret				;return final status
+
+;;
+;---------------------------------------
+; ll_write - write a sector to the IDE drive
+; input
+;   HL - memory address
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive reported a timeout
+;   A - 0FFH if the drive reported an error
+;   HL - points to the address after the last write
+; uses BC, DE, 2 stack words
+;
+ll_write:
+	call	ll_rdy			;is the drive ready?
+	ret	nz			;no - timeout
+
+	ld	d,ide_cmd_write
+	ld	e,ide_reg_cmd
+	call	ll_wc			;issue write command
+
+	call	ll_rdy			;can we proceed?
+	ret	nz			;no - timeout
+
+	call	ll_chk			;any errors?
+	ret	nz			;yes - something went wrong
+
+	call	ll_brdy			;is the buffer ready to write?
+	ret	nz			;no
+
+	call	ll_wb			;write the buffer
+
+	call	ll_rdy			;can we proceed?
+	ret	nz			;no - timeout
+
+	call	ll_chk			;any errors?
+	ret				;return final status
+
+;;
+;---------------------------------------
+; ide_calc_lba - calculate the LBA from the sector and track
+; input
+;   C - sector (0-63)
+;   DE - track
+; return
+;   C - LBA0
+;   D - LBA2
+;   E - LBA1
+; uses
+;
+ide_calc_lba:
+	sla	c			;shift sector left by two
+	sla	c
+
+	;shift D,E,C right by two
+	xor	a			;clear carry
+	rr	d			;rotate right
+	rr	e
+	rr	c
+
+	xor	a			;clear carry
+	rr	d			;rotate right
+	rr	e
+	rr	c
+	ret				;and done
+
+;;
+;---------------------------------------
+; ll_rdy - test if the IDE drive is ready to accept a command
+; return
+;   A - 0 if the drive is ready to accept a command
+;   A - 0FEH if the drive is not ready
+; uses B, DE, 1 stack word
+;
+ll_rdy:
+	ld	b,ide_retries		;number of retries to timeout
+ll_rdy0:
+	ld	e,ide_reg_status
+	call	ll_rc			;read status register
+
+	ld	a,d
+	and	ide_BSY+ide_DRDY	;return if not BUSY and DRDY
+	xor	ide_DRDY
+	ret	z
+
+	ld	a,10			;wait a millisecond
+	call	delay_100us
+	djnz	ll_rdy0			;retry
+
+	xor	a			;timeout
+	dec	a
+	dec	a
+	ret
+
+;;
+;---------------------------------------
+; ll_brdy - check whether the data request buffer is ready
+; return
+;   A - 0 if the buffer is ready
+;   A - 0FEH if the buffer is not ready
+; uses B, DE, 1 stack word
+;
+ll_brdy:
+	ld	b,ide_retries		;how many retries?
+ll_brdy0:
+	ld	e,ide_reg_status
+	call	ll_rc			;read status register
+
+	ld	a,d
+	cpl				;invert the DRQ bit
+	and	ide_DRQ			;and test
+	ret	z			;buffer is ready
+
+	ld	a,10			;wait a millisecond
+	call	delay_100us
+	djnz	ll_brdy0		;retry
+
+	xor	a			;timeout
+	dec	a
+	dec	a
+	ret
+
+;;
+;---------------------------------------
+; ll_chk - test if there is any error flagged by the controller
+; return
+;   A - 0 if the device has no errors
+;   A - 0FFH if the device has errors
+; uses DE, 1 stack word
+;
+ll_chk:
+	ld	e,ide_reg_status
+	call	ll_rc			;read status register
+	ld	a,d
+	and	ide_ERR			;test error bit
+	ret	z			;everything is OK
+
+	xor	a			;report error
+	dec	a
+	ret
+
+;;
+;---------------------------------------
+; ll_rc - low level read of the IDE drive controller
+; input
+;   E - the IDE register to read
+; return
+;   D - the read data
+; uses
+;
+ll_rc:
+	ld	a,e
+	out	(ide_port_C),a		;select IDE register
+
+	or	ide_rd_line
+	out	(ide_port_C),a		;assert RD line
+	nop				;delay
+
+	in	a,(ide_port_A)
+	ld	d,a			;return with data in D
+
+	ld	a,e
+	out	(ide_port_C),a		;deassert RD line
+
+	xor	a
+	out	(ide_port_C),a		;deselect all lines including RD line
+	ret
+
+;;
+;---------------------------------------
+; ll_wc - low level write to the IDE drive controller
+; input
+;   E - the IDE register to write
+;   D - the data to write
+; uses
+;
+ll_wc:
+	ld	a,ide_wr_config		;set 8255 to write mode
+	out	(ide_port_ctrl),a
+
+	ld	a,d			;put data
+	out	(ide_port_A),a
+
+	ld	a,e			;select IDE register
+	out	(ide_port_C),a
+
+	or	ide_wr_line
+	out	(ide_port_C),a		;assert WR line
+
+	ld	a,e
+	out	(ide_port_C),a		;deassert WR line
+
+	xor	a
+	out	(ide_port_C),a		;deselect all lines including WR line
+
+	ld	a,ide_rd_config		;set 8255 to read mode
+	out	(ide_port_ctrl),a
+	ret
+
+;;
+;---------------------------------------
+; ll_rb - low level read from the IDE controller buffer
+; input
+;   HL - memory address to write to
+; return
+;   HL - points to the address after the last write
+; uses BC
+;
+ll_rb:
+	ld	b,0			;we will read 256 words
+	ld	c,ide_reg_data		;set C to data register
+
+ll_rb0:
+	ld	a,c
+	out	(ide_port_C),a		;send data register
+
+	or	ide_rd_line
+	out	(ide_port_C),a		;assert RD line
+	nop				;delay
+
+	in	a,(ide_port_A)		;read low byte from controller
+	ld	(hl),a			;put low byte to memory
+	inc	hl
+
+	in	a,(ide_port_B)		;read high byte from controller
+	ld	(hl),a			;put high byte to memory
+	inc	hl
+
+	ld	a,c
+	out	(ide_port_C),a		;deassert RD line
+	djnz	ll_rb0			;read next word until done
+
+	xor	a
+	out	(ide_port_C),a		;deselect all lines including RD line
+	ret
+
+;;
+;---------------------------------------
+; ll_rw - low level read of a word from the IDE controller buffer
+; return
+;   HL - word read from the buffer
+; uses
+;
+ll_rw:
+	ld	a,ide_reg_data
+	out	(ide_port_C),a		;send data register
+
+	or	ide_rd_line
+	out	(ide_port_C),a		;assert RD line
+	nop				;delay
+
+	in	a,(ide_port_A)		;read low byte from controller
+	ld	l,a			;save low byte
+
+	in	a,(ide_port_B)		;read high byte from controller
+	ld	h,a			;save high byte
+
+	ld	a,ide_reg_data
+	out	(ide_port_C),a		;deassert RD line
+
+	xor	a
+	out	(ide_port_C),a		;deselect all lines including RD line
+	ret
+
+;;
+;---------------------------------------
+; ll_wb - low level write to the IDE controller buffer
+; input
+;   HL - memory address to read from
+; return
+;   HL - points to the address after the last read
+; uses BC
+;
+ll_wb:
+	ld	a,ide_wr_config		;set 8255 to write mode
+	out	(ide_port_ctrl),a
+
+	ld	b,0			;we will write 256 words
+	ld	c,ide_reg_data		;set C to data register
+
+ll_wb0:
+	ld	a,(hl)			;get low byte from memory
+	inc	hl
+	out	(ide_port_A),a		;write low byte to controller
+
+	ld	a,(hl)			;get high byte from memory
+	inc	hl
+	out	(ide_port_B),a		;write high byte to controller
+
+	ld	a,c
+	out	(ide_port_C),a		;send data register
+	or	ide_wr_line
+	out	(ide_port_C),a		;assert WR line
+	ld	a,c
+	out	(ide_port_C),a		;deassert WR line
+	djnz	ll_wb0
+
+	xor	a
+	out	(ide_port_C),a		;deselect all lines including WR line
+
+	ld	a,ide_rd_config
+	out	(ide_port_ctrl),a	;set 8255 to read mode
+	ret
+
+;;
+;---------------------------------------
+; ll_rst - low level reset of the IDE drive controller
+; return
+;   A - 0 if the command was successful
+;   A - 0FEH if the drive is not ready
+; uses B, DE, 1 stack word
+;
+ll_rst:
+	ld	a,ide_rd_config		;set 8255 to read mode
+	out	(ide_port_ctrl),a
+
+	ld	a,ide_rst_line		;hard reset the drive
+	out	(ide_port_C),a
+
+	ld	a,1
+	call	delay_100us		;assert for 100 microseconds
+					;spec is >25 microseconds
+
+	xor	a
+	out	(ide_port_C),a		;deassert reset
+
+	ld	a,50
+	call	delay_10ms		;wait for 500 ms for drive to initialize
+					;spec is >400 milliseconds
+
+	call	ll_rdy			;drive ready?
+	ret
+
+;;
+;---------------------------------------
+; delay routines
+;
+
+;;
+;---------------------------------------
+; delay_10ms - constants for 4MHz clock
+; input
+;   A - number of 10ms ticks
+; uses DE
+;
+delay_10ms:
+	ld	d,48
+delay_10ms0:
+	ld	e,52
+delay_10ms1:
+	dec	e
+	jr	nz,delay_10ms1
+	dec	d
+	jr	nz,delay_10ms0
+	dec	a
+	jr	nz,delay_10ms
+	ret
+
+;;
+;---------------------------------------
+; delay_100us - constants for 4MHz clock
+; input
+;   A - number of 100us ticks
+; uses D
+;
+delay_100us:
+	ld	d,25
+delay_100us0:
+	dec	d
+	jr	nz,delay_100us0
+	dec	a
+	jr	nz,delay_100us
+	ret
+
+;;
+;---------------------------------------
+; ide_put_idi - output IDE identify drive information
+;
+;  IDE identify drive information
+;  256 words (0-255) (512 bytes)
+;  word 1  - number of cylinders
+;  word 3  - number of heads
+;  word 5  - number of bytes per sector
+;  word 6  - number of sectors per track
+;  word 10 - serial number (10 words), first word 0 - not specified
+;  word 23 - firmware revision (4 words), first word 0 - not specified
+;  word 27 - model number (20 words), first word 0 - not specified
+;  word 60 - total sectors (LSW)
+;  word 61 - total sectors (MSW)
+;
+ide_put_idi:
+	call	ll_rdy			;is the drive ready?
+	jr	nz,ide_pi6		;no - timeout
+
+	ld	e,ide_reg_cmd
+	ld	d,ide_cmd_id
+	call	ll_wc			;write identify command to drive
+
+	call	ll_rdy			;can we proceed?
+	jr	nz,ide_pi6		;no - timeout
+
+	call	ll_chk			;any errors?
+	jr	nz,ide_pi6		;yes - something went wrong
+
+	call	ll_brdy			;is the buffer ready to read?
+	jr	nz,ide_pi6		;no
+
+	ld	de,ide_pi_tbl		;get command table
+ide_pi0:				;loop through table
+	ld	a,(de)			;get command
+	inc	de
+	cp	cmd_skip		;dispatch
+	jr	z,ide_pi1
+	cp	cmd_word
+	jr	z,ide_pi3
+	cp	cmd_dword
+	jr	z,ide_pi4
+	cp	cmd_field
+	jr	z,ide_pi5
+	ret				;end command
+
+ide_pi1:				;do skip word command
+	ld	a,(de)			;get skip count
+	inc	de
+	ld	b,a
+ide_pi2:
+	call	ll_rw			;read word and loop
+	djnz	ide_pi2
+	jr	ide_pi0
+
+ide_pi3:				;do single word command
+	call	ide_pi_msg		;output message
+	call	ll_rw			;get word
+	call	put_word		;output word
+	call	put_crlf
+	jr	ide_pi0
+
+ide_pi4:				;do double word command
+	call	ide_pi_msg		;output message
+	call	ll_rw			;get LSW
+	push	hl
+	call	ll_rw			;get MSW
+	call	put_word		;output MSW
+	pop	hl
+	call	put_word		;output LSW
+	call	put_crlf
+	jr	ide_pi0
+
+ide_pi5:				;do field command
+	call	ide_pi_msg		;output message
+	ld	a,(de)
+	inc	de
+	ld	b,a			;get field width
+	call	ide_pi_field		;output field
+	call	put_crlf
+	jr	ide_pi0
+
+ide_pi6:				;timeout or error
+	push	af
+	ld	hl,ide_pi_msg8
+	call	puts
+	pop	af
+	call	ide_put_status
+	ret
+
+;;
+;---------------------------------------
+; ide_pi_tbl - table of commands to process the identify drive information record
+; there are five commands defined: end, skip, word, dword, and field
+;
+; cmd_end:   end processing
+; cmd_skip:  skip word(s) in record - 1 parameter: skip count (byte)
+; cmd_word:  display word - 1 parameter: message address (word)
+; cmd_dword: display double word - 1 parameter: message address (word)
+; cmd_field: display field - 2 parameters: message address (word), field width (byte)
+;
+cmd_end 	equ	0
+cmd_skip	equ	1
+cmd_word	equ	2
+cmd_dword	equ	3
+cmd_field	equ	4
+
+ide_pi_tbl:
+	db	cmd_skip,1	;word 0
+	db	cmd_word	;word 1 - number of cylinders
+	dw	ide_pi_msg0
+	db	cmd_skip,1	;word 2
+	db	cmd_word	;word 3 - number of heads
+	dw	ide_pi_msg1
+	db	cmd_skip,1	;word 4
+	db	cmd_word	;word 5 - number of bytes per sector
+	dw	ide_pi_msg2
+	db	cmd_word	;word 6 - number of sectors per track
+	dw	ide_pi_msg3
+	db	cmd_skip,3	;words 7-9
+	db	cmd_field	;words 10-19 - serial number
+	dw	ide_pi_msg4
+	db	10
+	db	cmd_skip,3	;words 20-22
+	db	cmd_field	;words 23-26 - firmware revision
+	dw	ide_pi_msg5
+	db	4
+	db	cmd_field	;words 27-46 - model number
+	dw	ide_pi_msg6
+	db	20
+	db	cmd_skip,13	;words 47-59
+	db	cmd_dword	;words 60-61 - total sectors
+	dw	ide_pi_msg7
+	db	cmd_skip,194	;words 62-255
+	db	cmd_end
+
+ide_pi_msg0:
+	db	'Cylinders: ',0
+ide_pi_msg1:
+	db	'Heads: ',0
+ide_pi_msg2:
+	db	'Bytes Per Sector: ',0
+ide_pi_msg3:
+	db	'Sectors Per Track: ',0
+ide_pi_msg4:
+	db	'S/N: ',0
+ide_pi_msg5:
+	db	'Rev: ',0
+ide_pi_msg6:
+	db	'Model: ',0
+ide_pi_msg7:
+	db	'Total Sectors: ',0
+ide_pi_msg8:
+	db	'Error',CR,LF,0
+
+;;
+;---------------------------------------
+; ide_pi_msg - output the message from the table
+; input
+;   DE - command table
+;
+ide_pi_msg:
+	ld	a,(de)			;get message from table
+	inc	de
+	ld	l,a
+	ld	a,(de)
+	inc	de
+	ld	h,a
+	call	puts			;and print
+	ret
+
+;;
+;---------------------------------------
+; ide_pi_field - outputs an identify drive information string field
+; input
+;   B - the field length in words
+;
+ide_pi_field:
+	dec	b
+	call	ll_rw			;word 0
+	ld	a,l
+	or	h
+	jr	z,ide_pf1		;word 0 is zero, skip output
+
+	ld	c,l			;not zero, output
+	call	put_pch			;check printable and output LSB
+	ld	c,h
+	call	put_pch			;check printable and output MSB
+
+ide_pf0:
+	call	ll_rw			;word n
+
+	ld	c,l
+	call	put_pch			;check printable and output LSB
+	ld	c,h
+	call	put_pch			;check printable and output MSB
+	djnz	ide_pf0
+	ret				;and done
+
+ide_pf1:				;skip rest of buffer
+	call	ll_rw			;word n, skip
+	djnz	ide_pf1
+
+	ld	hl,ide_pf_msg		;output not specified
+	call	puts
+	ret
+
+ide_pf_msg:
+	db	'Not specified',0
+
+;;
+;---------------------------------------
+; monitor routines
+;
+
+;;
+;---------------------------------------
+; do_cmd - do command in command table
+;   jumps to command or jumps to cmd_error if command not found
+; input
+;   DE - line buffer ptr
+;   HL - command table
+;
+do_cmd:
+	ld	a,(de)			;input char
+	call	to_upper
+	cp	(hl)			;compare command with table
+	jr	z,do_cmd0		;match, prepare jump to command
+	ld	a,(hl)			;test for end of table
+	and	a
+	jr	z,cmd_error		;end of table
+	inc	hl			;skip to next entry
+	inc	hl
+	inc	hl
+	jr	do_cmd			;and loop
+
+do_cmd0:
+	inc	de			;advance line buffer
+	inc	hl			;load jump address
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a
+	jp	(hl)			;and jump to command
+
+;;
+;---------------------------------------
+; cmd_error - output error message
+;
+cmd_error:
+	ld	hl,cmd_error_msg
+	call	puts
+	jp	warm_start
+
+cmd_error_msg:
+	db	'Error - use H for help',CR,LF,0
+
+;;
+;---------------------------------------
+; cmd_ok - output OK message
+;
+cmd_ok:
+	ld	hl,cmd_ok_msg
+	call	puts
+	jp	warm_start
+
+cmd_ok_msg:
+	db	'OK',CR,LF,0
+
+;;
+;---------------------------------------
+; root_cmd_table
+; - format is byte for command character, word for command address
+; - zero byte ends the table
+;
+root_cmd_table:
+	db	'B'
+	dw	boot_cmd
+	db	'C'
+	dw	do_ctrl_cmd
+	db	'D'
+	dw	do_disk_cmd
+	db	'H'
+	dw	help_cmd
+	db	'M'
+	dw	do_mem_cmd
+	db	'P'
+	dw	do_port_cmd
+	db	0
+
+;;
+;---------------------------------------
+; do_ctrl_cmd - control commands
+;
+do_ctrl_cmd:
+	ld	hl,ctrl_cmd_table
+	jp	do_cmd			;and do the command
+
+ctrl_cmd_table:
+	db	'B'
+	dw	bank_cmd
+	db	'D'
+	dw	delay_cmd
+	db	'I'
+	dw	iobyte_cmd
+	db	'J'
+	dw	jmp_cmd
+	db	0
+
+;;
+;---------------------------------------
+; do_disk_cmd - disk commands
+;
+do_disk_cmd:
+	ld	hl,disk_cmd_table
+	jp	do_cmd			;and do the command
+
+disk_cmd_table:
+	db	'I'
+	dw	disk_init_cmd
+	db	'R'
+	dw	disk_read_cmd
+	db	'S'
+	dw	disk_status_cmd
+	db	'W'
+	dw	disk_write_cmd
+	db	0
+
+;;
+;---------------------------------------
+; do_mem_cmd - memory commands
+;
+do_mem_cmd:
+	ld	hl,mem_cmd_table
+	jp	do_cmd			;and do the command
+
+mem_cmd_table:
+	db	'D'
+	dw	mem_dump_cmd
+	db	'E'
+	dw	mem_edit_cmd
+	db	'F'
+	dw	mem_fill_cmd
+	db	'L'
+	dw	mem_load_cmd
+	db	'M'
+	dw	mem_move_cmd
+	db	'S'
+	dw	mem_scan_cmd
+	db	0
+
+;;
+;---------------------------------------
+; do_port_cmd - I/O port commands
+;
+do_port_cmd:
+	ld	hl,port_cmd_table
+	jp	do_cmd			;and do the command
+
+port_cmd_table:
+	db	'I'
+	dw	port_input_cmd
+	db	'O'
+	dw	port_output_cmd
+	db	'S'
+	dw	port_scan_cmd
+	db	0
+
+;;
+;---------------------------------------
+; root commands
+;
+
+;;
+;---------------------------------------
+; boot_cmd - boot from disk
+; input
+;   DE - line buffer ptr
+;
+boot_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	hl,boot_c_msg0
+	call	puts
+
+	call	ide_reset		;reset the drive controller
+	jr	nz,boot_cmd0
+
+	xor	a			;bank 0 for CP/M
+	call	set_bank
+
+	ld	b,ldr_count		;sector count
+	ld	c,ldr_sector		;starting sector
+	ld	de,ldr_track		;starting track
+	ld	hl,ldr_addr		;load address
+	ld	ix,ll_read		;read function
+
+	call	ll_multi_op		;and read
+	jr	nz,boot_cmd0		;report error
+
+	jp	ldr_addr		;and jump to CPMLDR
+
+boot_cmd0:
+	push	af
+	ld	hl,boot_c_msg1
+	call	puts
+	pop	af
+	call	ide_put_status
+	ret
+
+boot_c_msg0:
+	db	'BOOT from Z80 SBC IDE drive',CR,LF,0
+boot_c_msg1:
+	db	'Boot Error',CR,LF,0
+
+;;
+;---------------------------------------
+; help_cmd - display help
+; input
+;   DE - line buffer ptr
+;
+help_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	hl,help_cmd_msg
+	call	puts
+	ret
+
+help_cmd_msg:
+	db	'B - boot from disk',CR,LF
+	db	'H - display this help',CR,LF
+	db	CR,LF
+	db	'CB bank - select ROM/RAM bank',CR,LF
+	db	'CD - test delay function',CR,LF
+	db	'CI - display IOBYTE',CR,LF
+	db	'CJ address - jump to address',CR,LF
+	db	CR,LF
+	db	'DI - reset disk controller',CR,LF
+	db	'DR address,count,track,sector - read disk sector',CR,LF
+	db	'DS - display controller and disk status',CR,LF
+	db	'DW address,count,track,sector - write disk sector',CR,LF
+	db	CR,LF
+	db	'MD start,end - display memory contents',CR,LF
+	db	'ME address - edit memory contents, +, -, value, RET to end',CR,LF
+	db	'MF start,end,data - fill memory',CR,LF
+	db	'ML - load memory from Intel hex format input',CR,LF
+	db	'MM start,end,destination - move memory',CR,LF
+	db	'MS - scan memory and display (RAM/ROM/none)',CR,LF
+	db	CR,LF
+	db	'PI port - input from selected port',CR,LF
+	db	'PO port,data - output to selected port',CR,LF
+	db	'PS - scan ports for activity',CR,LF
+	db	0
+
+;;
+;---------------------------------------
+; control commands
+;
+
+;;
+;---------------------------------------
+; bank_cmd - set RAM bank
+; input
+;   DE - line buffer ptr
+;
+bank_cmd:
+	call	get_byte_arg		;get bank
+	jp	c,cmd_error
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	a,l
+	cp	4			;range?
+	jp	nc,cmd_error		;error
+
+bank_cmd0:
+	call	set_bank		;set bank
+	jp	cmd_ok
+
+;;
+;---------------------------------------
+; delay_cmd - test the delay interval
+; input
+;   DE - line buffer ptr
+;
+delay_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	hl,delay_c_msg		;show the delay message
+	call	puts
+
+	ld	b,9
+delay_cmd0:
+	ld	c,b
+	call	put_byte
+	ld	c,'.'
+	call	putc
+	call	putc
+
+	ld	a,100			;one second
+	call	delay_10ms
+
+	djnz	delay_cmd0
+
+	ld	c,0
+	call	put_byte
+	call	put_crlf
+	ret
+
+delay_c_msg:
+	db	'Delay: ',0
+
+;;
+;---------------------------------------
+; jmp_cmd - jump to address
+; input
+;   DE - line buffer ptr
+;
+jmp_cmd:
+	call	get_word_arg		;get address
+	jp	c,cmd_error
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	sp,ram_top		;reset stack pointer to top of RAM
+	jp	(hl)			;jump to address
+
+;;
+;---------------------------------------
+; iobyte_cmd - display IOBYTE
+; input
+;   DE - line buffer ptr
+;
+iobyte_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	hl,iobyte_msg		;report iobyte
+	call	puts
+
+	call	get_iobyte
+	ld	c,a
+	call	put_bbyte
+
+	ld	c,'B'
+	call	putc
+	call	put_crlf
+	ret
+
+iobyte_msg:
+	db	'IOByte: ',0
+
+;;
+;---------------------------------------
+; disk commands
+;
+
+;;
+;---------------------------------------
+; disk_init_cmd - initialize disk
+; input
+;   DE - line buffer ptr
+;
+disk_init_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	call	ide_reset		;reset the IDE controller
+	jp	z,cmd_ok
+
+	push	af
+	ld	hl,disk_i_msg
+	call	puts
+	pop	af
+	call	ide_put_status
+	ret
+
+disk_i_msg:
+	db	'Reset Error',CR,LF,0
+
+;;
+;---------------------------------------
+; disk_read_cmd - read a disk sector
+; input
+;   DE - line buffer ptr
+;
+disk_read_cmd:
+	ld	ix,ll_read		;disk read
+	jr	disk_common		;to common code
+
+;;
+;---------------------------------------
+; disk_status_cmd - display the disk status
+; input
+;   DE - line buffer ptr
+;
+disk_status_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	call	ide_put_idi		;output the IDE identify drive information
+	xor	a
+	call	ide_put_status		;output controller status
+	ret
+
+;;
+;---------------------------------------
+; disk_write_cmd - write a disk sector
+; input
+;   DE - line buffer ptr
+;
+disk_write_cmd:
+	ld	ix,ll_write		;disk write
+	jr	disk_common		;to common code
+
+;;
+;---------------------------------------
+; disk_common - common code for disk read/write
+; input
+;   DE - line buffer ptr
+;   IX - read/write routine
+;
+disk_common:
+	call	get_word_arg		;get memory address
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_byte_arg		;get sector count
+	jp	c,cmd_error
+
+	ld	a,l			;0 sector count
+	and	a
+	jp	z,cmd_error
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_word_arg		;get track
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_byte_arg		;get sector
+	jp	c,cmd_error
+
+	ld	a,l			;greater than max sectors
+	cp	ide_max_sec
+	jp	nc,cmd_error
+	push	hl			;store
+
+	call	match_EOL
+	jp	c,cmd_error
+
+	pop	hl			;restore sector
+	ld	c,l
+	pop	de			;restore track
+	pop	hl			;restore sector count
+	ld	b,l
+	pop	hl			;restore memory address
+	ld	ix,ll_read
+	call	ll_multi_op
+	jp	z,cmd_ok
+
+	push	af			;report error
+	ld	hl,disk_t_msg
+	call	puts
+	pop	af
+	call	ide_put_status
+	ret
+
+disk_t_msg:
+	db	'Disk Error',CR,LF,0
+
+;;
+;---------------------------------------
+; memory commands
+;
+
+;;
+;---------------------------------------
+; mem_dump_cmd - dump memory
+; input
+;   DE - line buffer ptr
+;
+mem_dump_cmd:
+	call	get_word_arg		;get start address
+	jp	c,cmd_error
+	ld	a,l			;truncate to even 16 bytes
+	and	0F0H
+	ld	l,a
+	push	hl			;push start address on stack
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_word_arg		;get end address
+	jp	c,cmd_error
+
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	de,0010H		;round up to even 16 bytes
+	add	hl,de
+	ld	a,l
+	and	0F0H
+	ld	l,a
+	push	hl			;store
+
+	pop	de
+	pop	hl
+	;DE - end address
+	;HL - start address
+mem_dump0:
+	push	hl			;for byte loop
+	call	put_word		;put address
+
+	push	hl
+	ld	hl,mem_d_msg		;and a colon
+	call	puts
+	pop	hl
+
+	ld	b,10H			;16 bytes at a time
+mem_dump1:
+	ld	c,(hl)			;get byte
+	call	put_byte		;and print it
+	ld	c,' '			;print a space
+	call	putc
+	inc	hl			;increment address
+	djnz	mem_dump1		;continue with this line
+
+	ld	c,' '
+	call	putc
+
+	pop	hl			;get address
+	ld	b,10H			;16 characters at a time
+mem_dump2:
+	ld	c,(hl)			;get byte
+	call	put_pch			;output if printable
+	inc	hl			;increment address
+	djnz	mem_dump2
+
+	call	put_crlf
+	call	check_pause		;check for control-S, control-C, ESC
+	ret	c
+
+	call	cp_HLDE			;test if done
+	jp	nz,mem_dump0		;more to do
+	ret
+
+mem_d_msg:
+	db	': ',0
+
+;;
+;---------------------------------------
+; mem_edit_cmd - edit memory
+; input
+;   DE - line buffer ptr
+;
+mem_edit_cmd:
+	call	get_word_arg		;get edit address
+	jp	c,cmd_error
+
+	call	match_EOL
+	jp	c,cmd_error
+
+	;HL - address
+mem_edit0:
+	push	hl
+	call	put_word		;display address
+
+	ld	hl,mem_e_msg0
+	call	puts
+
+	pop	hl
+	push	hl
+	ld	c,(hl)
+	call	put_byte		;display value
+
+	ld	hl,mem_e_msg1
+	call	puts
+
+	ld	b,line_size
+	ld	de,line_buffer
+	call	get_line		;get input line
+
+	call	match_EOL		;blank line?
+	jp	nc,cmd_ok		;yes, done
+
+	pop	hl
+	ld	a,(de)
+	call	to_upper
+	cp	'P'			;check for P,- for previous address
+	jr	z,mem_edit2
+	cp	'-'
+	jr	z,mem_edit2
+
+	cp	'N'			;check for N,+ for next address
+	jr	z,mem_edit1
+	cp	'+'
+	jr	z,mem_edit1
+
+	push	hl
+	call	get_byte_arg		;get value
+	jp	c,cmd_error
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	a,l
+	pop	hl
+	ld	(hl),a			;and store
+
+mem_edit1:
+	inc	hl			;next address
+	jr	mem_edit0
+
+mem_edit2:
+	dec	hl			;previous address
+	jr	mem_edit0
+
+mem_e_msg0:
+	db	' [',0
+mem_e_msg1:
+	db	']: ',0
+
+;;
+;---------------------------------------
+; mem_fill_cmd - fill memory
+; input
+;   DE - line buffer ptr
+;
+mem_fill_cmd:
+	call	get_word_arg		;get start address
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_word_arg		;get end address
+	jp	c,cmd_error
+	inc	hl			;end + 1
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_byte_arg		;get fill value
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_EOL
+	jp	c,cmd_error
+
+	pop	bc
+	pop	de
+	pop	hl
+	;C - fill value
+	;DE - end address + 1
+	;HL - start address
+mem_fill0:
+	ld	(hl),c
+	inc	hl
+	call	cp_HLDE
+	jr	nz,mem_fill0
+
+	jp	cmd_ok
+
+;;
+;---------------------------------------
+; mem_load_cmd - load Intel hex
+; input
+;   DE - line buffer ptr
+;
+; record format:
+;   ':',
+;   record length (2 hex characters),
+;   load address field (4 hex characters),
+;   record type field (2 characters),
+;   data field (2 * record length characters),
+;   checksum
+; valid record types are 0 (data) and 1 (end of file)
+;
+mem_load_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	hl,mem_l_msg0
+	call	puts
+
+mem_load0:
+	ld	b,line_size
+	ld	de,line_buffer
+	call	get_line		;get input line
+	call	match_EOL		;blank line?
+	jr	nc,mem_load0		;yes, skip
+
+	ld	a,(de)
+	inc	de
+	cp	':'			;is it a colon?
+	jr	nz,mem_load0		;no, skip line
+
+	;B - record length
+	;C - running checksum
+	;DE - line buffer ptr
+	;HL - load address
+
+	call	get_byte		;get record length
+	jr	c,mem_load4
+	ld	b,a			;save
+	ld	c,a			;init checksum
+
+	call	get_byte		;get load address
+	jr	c,mem_load4
+	ld	h,a			;save hish
+	add	c			;calc checksum
+	ld	c,a
+	call	get_byte
+	jr	c,mem_load4
+	ld	l,a			;save low
+	add	c			;calc checksum
+	ld	c,a
+
+	call	get_byte		;get record type
+	jr	c,mem_load4
+	cp	0			;data record?
+	jr	z,mem_load1		;yes
+	cp	1			;EOF record?
+	jr	nz,mem_load4		;no, syntax error
+
+	add	c			;EOF record
+	ld	c,a			;calc record type checksum
+
+	call	get_byte		;get line checksum
+	jr	c,mem_load4
+
+	add	c			;zero?
+	jr	nz,mem_load3		;no, checksum error
+
+	jp	cmd_ok			;done
+
+mem_load1:				;data record
+	add	c			;calc record type checksum
+	ld	c,a
+
+mem_load2:
+	call	get_byte		;get data byte
+	jr	c,mem_load4
+	ld	(hl),a			;store byte into memory
+	inc	hl			;increment pointer
+	add	c			;calc checksum
+	ld	c,a
+	djnz	mem_load2		;next byte
+
+	call	get_byte		;get line checksum
+	jr	c,mem_load4
+
+	add	c			;zero?
+	jr	nz,mem_load3		;no, checksum error
+	jr	mem_load0		;read next record
+
+mem_load3:
+	ld	hl,mem_l_msg1
+	call	puts			;print checksum error message
+	ret
+
+mem_load4:
+	ld	hl,mem_l_msg2
+	call	puts			;print syntax error message
+	ret
+
+mem_l_msg0:
+	db	'Waiting:',CR,LF,0
+mem_l_msg1:
+	db	'Checksum Error',CR,LF,0
+mem_l_msg2:
+	db	'Syntax Error',CR,LF,0
+
+;;
+;---------------------------------------
+; mem_move_cmd - move memory
+; input
+;   DE - line buffer ptr
+;
+mem_move_cmd:
+	call	get_word_arg		;get start address
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_word_arg		;get end address
+	jp	c,cmd_error
+	inc	hl			;end + 1
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_word_arg		;get destination address
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_EOL
+	jp	c,cmd_error
+
+	pop	bc
+	pop	de
+	pop	hl
+	;BC - destination address
+	;DE - end address + 1
+	;HL - start address
+mem_move0:
+	ld	a,(hl)			;and do the move
+	ld	(bc),a
+	inc	bc
+	inc	hl
+	call	cp_HLDE
+	jr	nz,mem_move0
+
+	jp	cmd_ok
+
+;;
+;---------------------------------------
+; mem_scan_cmd - scan memory - show RAM, ROM, no memory
+; input
+;   DE - line buffer ptr
+;
+mem_scan_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	hl,0			;start at 0000H
+mem_scan0:
+	call	put_word		;output address
+	ld	c,':'
+	call	putc
+
+	ld	b,16			;initialize page count
+mem_scan1:
+	ld	e,'W'			;print 'W' for writeable RAM
+
+	ld	a,(hl)			;read
+	cpl				;complement
+	ld	(hl),a			;write
+	cp	(hl)			;compare
+	cpl
+	ld	(hl),a			;and restore
+	jr	nz,mem_scan2		;not writeable
+
+	cp	(hl)			;writeable
+	jr	z,mem_scan4		;RAM
+
+mem_scan2:
+	ld	e,'R'			;print 'R' for readable ROM
+
+mem_scan3:
+	ld	a,0ffH
+	cp	(hl)			;reads 0ffH?
+	jr	nz,mem_scan4		;no - ROM
+
+	inc	l			;yes - try next byte
+	ld	a,l
+	and	a
+	jr	nz,mem_scan3		;try entire page
+
+	ld	e,'.'			;print '.' for no memory
+
+mem_scan4:
+	ld	c,' '
+	call	putc
+	ld	c,e
+	call	putc			;output type
+
+	ld	l,0			;clear l
+	inc	h			;next page
+	djnz	mem_scan1
+
+	call	put_crlf
+	ld	a,h
+	and	a
+	jr	nz,mem_scan0		;next 16 pages
+	ret
+
+;;
+;---------------------------------------
+; port commands
+;
+
+;;
+;---------------------------------------
+; port_input_cmd - input from port
+; input
+;   DE - line buffer ptr
+;
+port_input_cmd:
+	call	get_byte_arg		;get port
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	hl,port_msg0
+	call	puts
+
+	pop	hl
+	push	hl
+	ld	c,l
+	call	put_byte
+
+	ld	hl,port_msg1
+	call	puts
+
+	pop	hl
+	ld	c,l
+	in	a,(c)
+	ld	c,a
+	call	put_byte
+	call	put_crlf
+	ret
+
+;;
+;---------------------------------------
+; port_output_cmd - output from port
+; input
+;   DE - line buffer ptr
+;
+port_output_cmd:
+	call	get_byte_arg		;get port
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_comma
+	jp	c,cmd_error
+	call	get_byte_arg		;get data
+	jp	c,cmd_error
+	push	hl			;store
+
+	call	match_EOL
+	jp	c,cmd_error
+
+	pop	hl
+	ld	a,l
+	pop	hl
+	ld	c,l
+
+	out	(c),a			;output
+
+	jp	cmd_ok
+
+;;
+;---------------------------------------
+; port_scan_cmd - scan ports
+; input
+;   DE - line buffer ptr
+;
+port_scan_cmd:
+	call	match_EOL
+	jp	c,cmd_error
+
+	ld	b,0			;scan all ports
+	ld	d,0
+port_s0:
+	ld	c,d
+	in	a,(c)
+	cp	0FFH
+	jr	z,port_s1
+
+	ld	e,a			;save data
+	ld	hl,port_msg0
+	call	puts
+
+	ld	c,d			;load port
+	call	put_byte
+
+	ld	hl,port_msg1
+	call	puts
+
+	ld	c,e			;load data
+	call	put_byte
+	call	put_crlf
+	call	check_pause
+	ret	c
+port_s1:
+	inc	d
+	djnz	port_s0
+	ret
+
+port_msg0:
+	db	'Port: ',0
+port_msg1:
+	db	' Data: ',0
+
+;;
+;---------------------------------------
+; command line routines
+;
+
+;;
+;---------------------------------------
+; get_line - get a line of input
+; input
+;   B - size of line buffer
+;   DE - line buffer ptr
+; uses BC,HL
+;
+get_line:
+	push	de
+	pop	hl
+
+	;B - remaining buffer space
+	;C - input char
+	;DE - line buffer start
+	;HL - line buffer ptr
+get_line0:
+	ld	a,b
+	and	a			;buffer full?
+	jr	z,get_line7		;yes, done
+
+get_line1:
+	call	getc			;get input
+	and	07FH			;7-bit ASCII
+	ld	c,a			;save input
+
+	cp	BACKSPACE		;backspace?
+	jr	z,get_line3
+	cp	TAB			;tab?
+	jr	z,get_line4
+	cp	LF			;LF?
+	jr	z,get_line5
+	cp	CR			;CR?
+	jr	z,get_line8
+	cp	CONTROL_U		;control-U?
+	jr	z,get_line9
+	cp	DELETE			;delete?
+	jr	z,get_line3
+
+	ld	(last_char),a		;save for CR/LF check
+	call	is_print		;printable?
+	jr	c,get_line1		;no, skip char
+
+get_line2:				;handle printable
+	ld	(hl),c			;add to line buffer
+	inc	hl
+	dec	b
+	call	putc			;echo
+	jr	get_line0		;loop
+
+get_line3:				;handle backspace/delete
+	ld	(last_char),a		;save for CR/LF check
+	call	cp_HLDE			;at beginning of line buffer?
+	jr	z,get_line1		;yes, loop
+	call	erase_ch		;do the erase
+	jr	get_line1		;loop
+
+get_line4:				;handle tab
+	ld	(last_char),a
+	ld	c,SPACE			;convert to single space
+	jr	get_line2
+
+get_line5:				;handle LF
+	ld	a,(last_char)
+	cp	CR			;test if LF after CR
+	ld	a,c
+	ld	(last_char),a		;save for next CR/LF check
+	jr	z,get_line1		;LF after CR, skip
+
+get_line6:
+	call	put_crlf		;echo CR/LF
+
+get_line7:				;append NUL and done
+	ld	c,NUL_CH
+	ld	(hl),c
+	ret				;done
+
+get_line8:				;handle CR
+	ld	(last_char),a		;save for CR/LF check
+	jr	get_line6		;echo
+
+get_line9:				;handle control-U
+	ld	(last_char),a		;save for CR/LF check
+
+get_line10:
+	call	cp_HLDE			;at beginning of line buffer?
+	jr	z,get_line1		;yes, loop
+	call	erase_ch		;do the erase
+	jr	get_line10		;loop until at beginning of line buffer
+
+;;
+;---------------------------------------
+; erase_ch - erase a character from the line buffer
+; input
+;   B - remaining buffer space
+;   HL - line buffer ptr
+; return
+;   B - remaining buffer space
+;   HL - updated line buffer ptr
+; uses C
+;
+erase_ch:
+	dec	hl			;remove from line buffer
+	inc	b
+
+	ld	c,BACKSPACE		;echo erase sequence
+	call	putc
+	ld	c,SPACE
+	call	putc
+	ld	c,BACKSPACE
+	call	putc
+	ret
+
+;;
+;---------------------------------------
+; get_byte_arg - get a hexadecimal argument from the line buffer
+;   leading zeroes, max 2 hex characters, optional trailing 'H'
+; input
+;   DE - line buffer ptr
+; return
+;   DE - updated line buffer ptr
+;   HL - argument value
+;   set carry if not a hexadecimal argument
+; uses B
+;
+get_byte_arg:
+	ld	b,2
+	jr	get_arg
+
+;;
+;---------------------------------------
+; get_word_arg - get a hexadecimal argument from the line buffer
+;   leading zeroes, max 4 hex characters, optional trailing 'H'
+; input
+;   DE - line buffer ptr
+; return
+;   DE - updated line buffer ptr
+;   HL - argument value
+;   set carry if not a hexadecimal argument
+; uses B
+;
+get_word_arg:
+	ld	b,4
+	jr	get_arg
+
+;;
+;---------------------------------------
+; get_arg - get a hexadecimal argument from the line buffer
+;   leading zeroes, max B hex characters, optional trailing 'H'
+; input
+;   B - maximum number of hex characters
+;   DE - line buffer ptr
+; return
+;   DE - updated line buffer ptr
+;   HL - argument value
+;   set carry if not a hexadecimal argument
+;
+get_arg:
+	call	skip_ws
+	ld	hl,0
+
+	ld	a,(de)
+	call	is_hex			;hex?
+	ret	c			;no
+
+	cp	'0'			;leading zero?
+	jr	nz,get_arg1		;no
+
+get_arg0:				;skip leading zeroes
+	inc	de
+	ld	a,(de)
+	call	is_hex
+	jr	c,get_arg2
+	cp	'0'
+	jr	z,get_arg0
+
+get_arg1:
+	ld	a,(de)
+	call	is_hex			;test if hex character
+	jr	c,get_arg2
+
+	add	hl,hl			;left shift by 4
+	add	hl,hl
+	add	hl,hl
+	add	hl,hl
+
+	ld	a,(de)
+	call	hex_to_bin		;convert char to binary
+	or	l
+	ld	l,a			;or into HL
+
+	inc	de			;next char
+	djnz	get_arg1		;loop or done
+
+get_arg2:				;optional trailing 'H'
+	ld	a,(de)
+	call	to_upper
+	cp	'H'
+	jr	nz,get_arg3
+	inc	de
+
+get_arg3:
+	and	a			;success, clear carry
+	ret
+
+;;
+;---------------------------------------
+; get_byte - get a hexadecimal byte from the line buffer
+; input
+;   DE - line buffer ptr
+; return
+;   A - the byte value
+;   DE - updated line buffer ptr
+;   set carry flag if not a hexadecimal byte
+;
+get_byte:
+	ld	a,(de)
+	call	is_hex			;hex digit?
+	ret	c
+	inc	de
+	call	hex_to_bin
+	rlca
+	rlca
+	rlca
+	rlca
+	push	bc
+	ld	c,a			;save upper four bits
+	ld	a,(de)
+	call	is_hex			;hex digit?
+	jr	c,get_byte0
+	inc	de
+	call	hex_to_bin
+	or	c			;combine both nibbles
+get_byte0:
+	pop	bc
+	ret
+
+;;
+;---------------------------------------
+; check_pause - pause if control-S until control-S or control-Q
+; return
+;   set carry if control-C, ESCAPE (cancellation)
+;
+check_pause:
+	call	rx_avail
+	jr	z,check_ccf		;no input
+
+	call	getc
+	cp	CONTROL_S
+	jr	z,check_pause0
+	cp	CONTROL_C
+	jr	z,check_scf
+	cp	ESCAPE
+	jr	z,check_scf
+	jr	check_ccf
+
+check_pause0:
+	call	getc
+	cp	CONTROL_S
+	jr	z,check_ccf
+	cp	CONTROL_Q
+	jr	z,check_ccf
+	cp	CONTROL_C
+	jr	z,check_scf
+	cp	ESCAPE
+	jr	z,check_scf
+	jr	check_pause0
+
+check_ccf:
+	xor	a			;clear carry
+	ret
+
+check_scf:
+	scf				;set carry
+	ret
+
+;;
+;---------------------------------------
+; skip_ws - skip whitespace in line buffer
+; input
+;   DE - line buffer ptr
+; return
+;   DE - updated line buffer ptr
+;
+skip_ws:
+	ld	a,(de)
+	cp	SPACE
+	ret	nz
+	inc	de
+	jr	skip_ws
+
+;;
+;---------------------------------------
+; match_comma - match comma in line buffer
+; input
+;   DE - line buffer ptr
+; return
+;   DE - updated line buffer ptr
+;   set carry flag if not a comma
+;
+match_comma:
+	call	skip_ws
+	ld	a,(de)
+	cp	','
+	jr	nz,match_comma0
+	inc	de
+	ret
+match_comma0:
+	scf
+	ret
+
+;;
+;---------------------------------------
+; match_EOL - match EOL in line buffer
+; input
+;   DE - line buffer ptr
+; return
+;   DE - updated line buffer ptr
+;   set carry flag if not at EOL
+;
+match_EOL:
+	call	skip_ws
+	ld	a,(de)
+	and	a
+	ret	z
+	scf
+	ret
+
+;;
+;---------------------------------------
+; cp_HLDE - compare HL with DE
+; input
+;   HL
+;   DE
+; return
+;   set C,Z flags
+;
+cp_HLDE:
+	ld	a,h
+	cp	d
+	ret	nz
+	ld	a,l
+	cp	e
+	ret
+
+;;
+;---------------------------------------
+; character routines
+;
+
+;;
+;---------------------------------------
+; put_bbyte - output a byte in binary notation
+; input
+;  C - the byte
+; uses B, E, 1 stack word
+;
+put_bbyte:
+	ld	b,8
+	ld	e,c
+put_bbyte0:
+	sla	e			;move bit into carry
+	ld	a,18H
+	adc	a,a			;results in '0' or '1' based on carry
+	ld	c,a
+	call	putc
+	djnz	put_bbyte0
+	ret
+
+;;
+;---------------------------------------
+; put_digit - output a hex digit
+; input
+;   C - lower 4 bits contain the digit
+; uses 1 stack word
+;
+put_digit:
+	ld	a,c
+	and	0fH
+	add	'0'
+	cp	'9' + 1
+	jr	c,put_digit0
+	add	'A' - '0' - 10
+put_digit0:
+	ld	c,a
+	call	putc
+	ret
+
+;;
+;---------------------------------------
+; put_pch - output a printable character otherwise prints a dot
+; input
+;   C - the char
+; uses 1 stack word
+;
+put_pch:
+	ld	a,c
+	call	is_print		;is it printable?
+	jr	nc,put_pch0		;yes
+	ld	c,'.'			;no - print a dot
+put_pch0:
+	call	putc			;print the character
+	ret
+
+;;
+;---------------------------------------
+; to_upper - convert a character to upper case
+; input
+;   A - the character
+; return
+;   A - the character converted to uppercase
+; uses
+;
+to_upper:
+	cp	'a'			;nothing to do if not lower case
+	ret	c
+	cp	'z' + 1			;greater than 'z'?
+	ret	nc			;nothing to do, either
+	and	5FH			;convert to upper case
+	ret
+
+;;
+;---------------------------------------
+; is_print - checks whether a character is printable ASCII
+; input
+;   A - the character
+; return
+;   set carry flag if not printable
+; uses
+;
+is_print:
+	cp	SPACE
+	ret	c
+	cp	DELETE
+	jr	c,is_print0
+	scf
+	ret
+is_print0:
+	ccf
+	ret
+
+;;
+;---------------------------------------
+; is_hex - checks whether a character is a hexadecimal digit
+; input
+;   A - the character
+; return
+;   set carry flag if not a hexadecimal digit
+; uses
+;
+is_hex:
+	cp	'0'			;less than '0'?
+	ret	c
+	cp	'9' + 1			;less than or equal to '9'?
+	jr	c,is_hex0
+
+	cp	'A'			;less than 'A'?
+	ret	c
+	cp	'F' + 1			;less than or equal to 'F'?
+	jr	c,is_hex0
+
+	cp	'a'			;less than 'a'?
+	ret	c
+	cp	'f' + 1			;less than or equal to 'f'?
+is_hex0:
+	ccf				;complement carry and return
+	ret
+
+;;
+;---------------------------------------
+; hex_to_bin - convert a hexadecimal digit to its binary value
+; input
+;   A - the ASCII hexadecimal digit
+; return
+;   A - the corresponding binary value
+; uses
+;
+hex_to_bin:
+	cp	'9' + 1			;is it a digit?
+	jr	c,hex_to_bin1		;yes
+	cp	'F' + 1			;is it uppercase?
+	jr	c,hex_to_bin0		;yes
+	sub	32			;adjust for a-f
+hex_to_bin0:
+	sub	7			;adjust for A-F
+hex_to_bin1:
+	sub	'0'			;adjust to 0-15
+	and	0fH			;only return lower 4 bits
+	ret
+
+;;
+;---------------------------------------
+; put_regs - print out the registers (for debug)
+; uses 8 stack words
+;
+put_regs:
+	push	hl			;save registers (in reverse of usual order)
+	push	de
+	push	bc
+	push	af
+
+	ld	hl,put_regs_msg		;label
+	call	puts
+
+	ld	hl,0			;copy of SP to HL
+	add	hl,sp
+	ld	b,4
+put_regs0:				;loop for AF, BC, DE, HL
+	ld	e,(hl)			;get reg16 value from stack ptr
+	inc	hl
+	ld	d,(hl)
+	inc	hl
+	ex	de,hl			;reg16 value to HL, stack ptr to DE
+	call	put_word
+	ld	c,SPACE
+	call	putc
+	ex	de,hl			;stack ptr to HL
+	djnz	put_regs0
+
+	ld	e,(hl)			;PC - get return address from stack
+	inc	hl
+	ld	d,(hl)
+	inc	hl
+	dec	de			;subtract 3 for calling address
+	dec	de
+	dec	de			;DE is PC at call
+	ex	de,hl			;PC at call to HL, SP at call to DE
+	call	put_word
+	ld	c,SPACE
+	call	putc
+
+	ex	de,hl			;SP at call to HL
+	call	put_word
+	ld	c,SPACE
+	call	putc
+
+	push	ix			;IX
+	pop	hl
+	call	put_word
+	ld	c,SPACE
+	call	putc
+
+	push	iy			;IY
+	pop	hl
+	call	put_word
+	call	put_crlf
+
+	pop	af			;restore registers (in reverse of usual order)
+	pop	bc
+	pop	de
+	pop	hl
+	ret
+
+put_regs_msg:
+	db	'AF   BC   DE   HL   PC   SP   IX   IY',CR,LF,0
+
+rom_top	equ	$
+	end
