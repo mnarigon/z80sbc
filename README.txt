@@ -58,13 +58,10 @@ is available at: https://schorn.ch/altair.html. This tool is used to
 cross-assemble the ROM monitor and to cross-assemble/cross-link/cross-gencpm
 the CP/M 3 system.
 
-Download the 'Altair Z80 CP/M Version 3 with banked memory' version from Peter's
-web site and build. The resulting altairz80 executable should be installed to
-your system (/usr/local/bin) and available in your PATH.
-In the simh directory in this repository include the altairz80 cpm3.dsk disk
-image, and copy the altairz80 i.dsk image to i.dsk.orig (the build scripts
-start from fresh by copying i.dsk.orig to i.dsk to remove any changes before
-each run). If you want to manually run the simulator, also copy the cpm3 script.
+Download the appropriate simulator from Peter's web site. The resulting
+altairz80 executable should be installed to your system (/usr/local/bin) and
+available in your PATH. Versions of the altairZ80 disk images suitable for
+building the ROM and CP/M are already available in the simh directory.
 
 3. Building.
 
