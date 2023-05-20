@@ -1,7 +1,7 @@
 ;build CPM.SYS - SIMH command file
 d tracks[0-7] 254
 attach dsk cpm3.dsk
-attach hdsk0 i.dsk
+attach hdsk0 hd.dsk
 d common c000
 set cpu 64k
 set cpu banked

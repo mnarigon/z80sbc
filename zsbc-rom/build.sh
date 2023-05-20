@@ -13,7 +13,6 @@ cp zsbc-rom.z80 ../simh/ZSBC-ROM.Z80
 #
 # -- run simulator
 cd ../simh
-cp i.dsk.orig i.dsk
 altairz80 ZSBC-ROM.SIMH
 
 #

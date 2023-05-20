@@ -21,7 +21,6 @@ cp cpm_bld/Z80.LIB         ../simh/Z80.LIB
 #
 # -- run simulator to assemble and link CPMLDR
 cd ../simh
-cp i.dsk.orig i.dsk
 altairz80 CPMLDR.SIMH
 
 #

@@ -55,7 +55,6 @@ cp cpm_bld/Z80.LIB      ../simh/Z80.LIB
 #
 # -- run simulator to assemble, link, and sysgen CP/M
 cd ../simh
-cp i.dsk.orig i.dsk
 altairz80 CPM.SIMH
 
 #
