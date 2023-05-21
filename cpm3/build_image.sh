@@ -27,7 +27,7 @@ fi
 
 s0=$(file_size cpm_gen/CPMLDR.COM)
 t0=$(expr $s0 + 511)
-to=$(expr $t0 / 512)
+t0=$(expr $t0 / 512)
 echo "CPMLDR.COM is $s0 bytes ($t0 sectors) at track 0, sector 0"
 
 s1=$(file_size cpm_src/0/CCP.COM)
