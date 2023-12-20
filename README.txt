@@ -28,6 +28,11 @@ generation and ready states.
 Uses Logical Block Addressing (LBA) with 64 sectors per track.
 Extensive IDE controller error checking and status reporting.
 
+There is a Compact Flash image for a banked CP/M 3 system and a .hex file
+for the boot ROM in the release directory if you don't want to build the
+software. You will still have to read these instructions to configure the
+board and install the software.
+
 2. Installation.
 
 This software is developed on a macOS system. I have tested the scripts on a
