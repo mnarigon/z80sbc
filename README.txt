@@ -28,6 +28,9 @@ generation and ready states.
 Uses Logical Block Addressing (LBA) with 64 sectors per track.
 Extensive IDE controller error checking and status reporting.
 
+Version 1.0.1 of the boot ROM has changes in the IDE ready functions to improve
+performance.
+
 There is a Compact Flash image for a banked CP/M 3 system and a .hex file
 for the boot ROM in the release directory if you don't want to build the
 software. You will still have to read these instructions to configure the
@@ -188,8 +191,8 @@ operation is enabled with the default page 0 of the ROM selected on
 power on.
 
 Note that there are delay functions in the monitor that are tuned to a 4 MHz
-clock, so if you use a different clock you will have to modify these delay
-functions.
+clock, so if you use a different clock you will have to modify the cpu_clock
+const on line 8 of the zsbc-rom.z80 file to match the clock speed of your board.
   
 5. Monitor
 

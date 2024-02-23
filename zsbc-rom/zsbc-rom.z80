@@ -1,9 +1,11 @@
 	title 'Z80 SBC ROM Monitor'
 ;;
 ;---------------------------------------
+;  Z80 SBC memory map and clock speed
 ;
 rom_base	equ	0F000H
 ram_top		equ	rom_base
+cpu_clock	equ	4			;2-10 (MHz)
 
 ;;
 ;---------------------------------------
@@ -82,7 +84,6 @@ ide_cmd_id	equ	0ECH
 ;   512 byte physical sectors
 ;   64 sectors per track numbered (0-63)
 ide_max_sec	equ	64
-ide_retries	equ	100		;number of retries for polls
 
 ;;
 ;---------------------------------------
@@ -232,7 +233,7 @@ cold_start1:
 
 cold_msg:
 	db	CR,LF
-	db	'Z80 SBC ROM Monitor Version 1.0',CR,LF
+	db	'Z80 SBC ROM Monitor Version 1.0.1',CR,LF
 	db	'Type ''H'' for help',CR,LF,0
 
 ;;
@@ -328,7 +329,7 @@ tx_ready:
 ;   A - 0 if the command was successful
 ;   A - 0FEH if the controller reported a timeout
 ;   A - 0FFH if the controller reported an error
-; uses B, DE, 2 stack words
+; uses B, DE, 4 stack words
 ;
 ide_reset:
 	call	ll_rst			;reset the drive controller
@@ -346,7 +347,7 @@ ide_reset:
 ;   A - 0 if the command was successful
 ;   A - 0FEH if the drive reported a timeout
 ;   A - 0FFH if the drive reported an error
-; uses B, HL, 2 stack words
+; uses B, HL, 3 stack words
 ;
 ide_set_addr:
 	call	ide_calc_lba		;convert sector and track to LBA
@@ -387,7 +388,7 @@ ide_set_addr:
 ;   A - 0FEH if the drive reported a timeout
 ;   A - 0FFH if the drive reported an error
 ;   HL - points to the address after the last read
-; uses BC, DE, 2 stack words
+; uses BC, DE, 3 stack words
 ;
 ide_read:
 	jp	ll_read
@@ -402,7 +403,7 @@ ide_read:
 ;   A - 0FEH if the drive reported a timeout
 ;   A - 0FFH if the drive reported an error
 ;   HL - points to the address after the last read
-; uses BC, DE, 2 stack words
+; uses BC, DE, 3 stack words
 ;
 ide_write:
 	jp	ll_write
@@ -785,7 +786,7 @@ op_trampoline:
 ;   A - 0FEH if the drive reported a timeout
 ;   A - 0FFH if the drive reported an error
 ;   HL - points to the address after the last read
-; uses BC, DE, 2 stack words
+; uses BC, DE, 3 stack words
 ;
 ll_read:
 	call	ll_rdy			;is the drive ready?
@@ -822,7 +823,7 @@ ll_read:
 ;   A - 0FEH if the drive reported a timeout
 ;   A - 0FFH if the drive reported an error
 ;   HL - points to the address after the last write
-; uses BC, DE, 2 stack words
+; uses BC, DE, 3 stack words
 ;
 ll_write:
 	call	ll_rdy			;is the drive ready?
@@ -883,22 +884,27 @@ ide_calc_lba:
 ; return
 ;   A - 0 if the drive is ready to accept a command
 ;   A - 0FEH if the drive is not ready
-; uses B, DE, 1 stack word
+; uses B, DE, 2 stack words
 ;
 ll_rdy:
-	ld	b,ide_retries		;number of retries to timeout
+	ld	b,250			;100 ms (250*4*100us)
 ll_rdy0:
+	ld	d,4*(6*cpu_clock+cpu_clock/6+cpu_clock/10+1)
+ll_rdy1:
+	push	de
 	ld	e,ide_reg_status
 	call	ll_rc			;read status register
 
 	ld	a,d
+	pop	de
 	and	ide_BSY+ide_DRDY	;return if not BUSY and DRDY
 	xor	ide_DRDY
 	ret	z
 
-	ld	a,10			;wait a millisecond
-	call	delay_100us
-	djnz	ll_rdy0			;retry
+	dec	d			;loop if not ready
+	jr	nz,ll_rdy1
+	dec	b
+	jr	nz,ll_rdy0
 
 	xor	a			;timeout
 	dec	a
@@ -911,22 +917,27 @@ ll_rdy0:
 ; return
 ;   A - 0 if the buffer is ready
 ;   A - 0FEH if the buffer is not ready
-; uses B, DE, 1 stack word
+; uses B, DE, 2 stack words
 ;
 ll_brdy:
-	ld	b,ide_retries		;how many retries?
+	ld	b,250			;100 ms (250*4*100us)
 ll_brdy0:
+	ld	d,4*(6*cpu_clock+cpu_clock/6+cpu_clock/10+1)
+ll_brdy1:
+	push	de
 	ld	e,ide_reg_status
 	call	ll_rc			;read status register
 
 	ld	a,d
+	pop	de
 	cpl				;invert the DRQ bit
 	and	ide_DRQ			;and test
 	ret	z			;buffer is ready
 
-	ld	a,10			;wait a millisecond
-	call	delay_100us
-	djnz	ll_brdy0		;retry
+	dec	d			;loop if not ready
+	jr	nz,ll_brdy1
+	dec	b
+	jr	nz,ll_brdy0
 
 	xor	a			;timeout
 	dec	a
@@ -1121,7 +1132,7 @@ ll_wb0:
 ; return
 ;   A - 0 if the command was successful
 ;   A - 0FEH if the drive is not ready
-; uses B, DE, 1 stack word
+; uses B, DE, 3 stack words
 ;
 ll_rst:
 	ld	a,ide_rd_config		;set 8255 to read mode
@@ -1151,33 +1162,29 @@ ll_rst:
 
 ;;
 ;---------------------------------------
-; delay_10ms - constants for 4MHz clock
+; delay_10ms - delay for n 10ms ticks
 ; input
 ;   A - number of 10ms ticks
-; uses DE
+; uses DE, 1 stack word
 ;
 delay_10ms:
-	ld	d,48
+	ld	e,a
 delay_10ms0:
-	ld	e,52
-delay_10ms1:
+	ld	a,100
+	call	delay_100us
 	dec	e
-	jr	nz,delay_10ms1
-	dec	d
 	jr	nz,delay_10ms0
-	dec	a
-	jr	nz,delay_10ms
 	ret
 
 ;;
 ;---------------------------------------
-; delay_100us - constants for 4MHz clock
+; delay_100us - delay for n 100us ticks
 ; input
 ;   A - number of 100us ticks
 ; uses D
 ;
 delay_100us:
-	ld	d,25
+	ld	d,6*cpu_clock+cpu_clock/6+cpu_clock/10+1
 delay_100us0:
 	dec	d
 	jr	nz,delay_100us0
